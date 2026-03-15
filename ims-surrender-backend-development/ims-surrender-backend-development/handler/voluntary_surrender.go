@@ -22,7 +22,6 @@ import (
 	"gitlab.cept.gov.in/it-2.0-policy/surrender-service/handler/response"
 	repo "gitlab.cept.gov.in/it-2.0-policy/surrender-service/repo/postgres"
 	"gitlab.cept.gov.in/it-2.0-policy/surrender-service/temporal/activities"
-	"gitlab.cept.gov.in/it-2.0-policy/surrender-service/temporal/workflows"
 )
 
 // VoluntarySurrenderHandler handles all voluntary surrender operations
@@ -194,49 +193,17 @@ func mapToIndexSurrenderInput(req IndexSurrenderRequest) domain.IndexSurrenderRe
 }
 
 func (h *VoluntarySurrenderHandler) IndexSurrender(sctx *serverRoute.Context, req IndexSurrenderRequest) (interface{}, error) {
-
-	log.Error(sctx.Ctx, "policy number is : %s", req.PolicyNumber)
-
-	input := mapToIndexSurrenderInput(req)
-	//servicereqID, err := h.surrenderRepo.IndexSurrenderRequest(sctx.Ctx, req.PolicyNumber, req.Surrender_request_channel, req.Indexing_office_id, req.Cpc_office_id, req.Created_by, req.Modified_by, req.Remarks)
-
-	servicereqID, err := h.surrenderRepo.IndexSurrenderRequestRepo(sctx.Ctx, input)
-
-	log.Error(sctx.Ctx, "servicereqID from handler : %s", servicereqID)
-	if err != nil {
-		log.Error(sctx.Ctx, "policy number not found in handler %s", err)
-		return h.createIneligibleResponse1(req.PolicyNumber, []string{
-			fmt.Sprintf("Policy details not found - Wrong Policy number or Policy number doesnot exist."),
-		}), nil
-	}
-
-	// Start Temporal workflow
-	workflowID := "voluntary-surrender-" + servicereqID
-	workflowOptions := client.StartWorkflowOptions{
-		ID:        workflowID,
-		TaskQueue: "surrender-task-queue",
-	}
-
-	workflowInput := workflows.VoluntarySurrenderWorkflowInput{
-		SurrenderRequestID: servicereqID,
-		PolicyID:           req.PolicyNumber,
-		RequestNumber:      servicereqID,
-		RequestedBy:        fmt.Sprintf("%d", req.Created_by),
-	}
-
-	we, err := h.temporalClient.ExecuteWorkflow(sctx.Ctx, workflowOptions, workflows.VoluntarySurrenderWorkflow, workflowInput)
-	if err != nil {
-		log.Error(sctx.Ctx, "Failed to start Temporal workflow: %s", err)
-		return h.createIneligibleResponse1(req.PolicyNumber, []string{
-			fmt.Sprintf("Failed to start workflow: %v", err),
-		}), nil
-	}
-
-	log.Info(sctx.Ctx, "Started Temporal workflow", "WorkflowID", we.GetID(), "RunID", we.GetRunID())
-
-	return h.generateSurReqIDResponse(servicereqID, []string{
-		fmt.Sprintf("ID Generated and workflow started"),
-	}), nil
+	// Surrender requests must now be initiated through Policy Management.
+	// PM dispatches SurrenderProcessingWorkflow as a child workflow, which
+	// creates the surrender_request record via IndexSurrenderActivity.
+	// This endpoint is no longer the entry point.
+	log.Info(sctx.Ctx, "IndexSurrender called — surrender initiation must go through Policy Management")
+	return response.GetDEPendingResponse{
+		StatusCode: 410,
+		Success:    false,
+		Message:    "This endpoint is decommissioned. Surrender requests must be initiated through Policy Management (POST /v1/policies/{policy_number}/requests/surrender).",
+		Data:       nil,
+	}, nil
 }
 
 func (h *VoluntarySurrenderHandler) SRDetails(sctx *serverRoute.Context, req SRIDDetailsRequest) (interface{}, error) {
@@ -425,8 +392,18 @@ func (h *VoluntarySurrenderHandler) SubmitDE(sctx *serverRoute.Context, req1 Sub
 
 	log.Error(sctx.Ctx, "Surrender_request_id  is : %s", req1.Surrender_request_id)
 
-	// Send signal to Temporal workflow with activity input data
-	workflowID := "voluntary-surrender-" + req1.Surrender_request_id
+	// Look up the Temporal workflow ID stored during IndexSurrenderActivity so we
+	// can signal the correct SurrenderProcessingWorkflow instance.
+	workflowID, err := h.surrenderRepo.GetWorkflowIDBySurrenderRequestID(sctx.Ctx, req1.Surrender_request_id)
+	if err != nil {
+		log.Error(sctx.Ctx, "Failed to resolve workflow ID for DE: %s", err)
+		return response.GetDEPendingResponse{
+			StatusCode: 404,
+			Success:    false,
+			Message:    fmt.Sprintf("Surrender request not found or workflow not started: %v", err),
+			Data:       nil,
+		}, nil
+	}
 
 	// Create activity input from request
 	activityInput := activities.SubmitDEInput{
@@ -462,7 +439,7 @@ func (h *VoluntarySurrenderHandler) SubmitDE(sctx *serverRoute.Context, req1 Sub
 		PolicyNumber:            req1.PolicyNumber,
 	}
 
-	err := h.temporalClient.SignalWorkflow(sctx.Ctx, workflowID, "", "de-completed", activityInput)
+	err = h.temporalClient.SignalWorkflow(sctx.Ctx, workflowID, "", "de-completed", activityInput)
 	if err != nil {
 		log.Error(sctx.Ctx, "Failed to send DE signal: %s", err)
 		return response.GetDEPendingResponse{
@@ -488,8 +465,18 @@ func (h *VoluntarySurrenderHandler) SubmitQC(sctx *serverRoute.Context, req1 Sub
 
 	log.Error(sctx.Ctx, "Surrender_request_id  is : %s", req1.Surrender_request_id)
 
-	// Send signal to Temporal workflow with activity input data
-	workflowID := "voluntary-surrender-" + req1.Surrender_request_id
+	// Look up the Temporal workflow ID stored during IndexSurrenderActivity so we
+	// can signal the correct SurrenderProcessingWorkflow instance.
+	workflowID, err := h.surrenderRepo.GetWorkflowIDBySurrenderRequestID(sctx.Ctx, req1.Surrender_request_id)
+	if err != nil {
+		log.Error(sctx.Ctx, "Failed to resolve workflow ID for QC: %s", err)
+		return response.GetDEPendingResponse{
+			StatusCode: 404,
+			Success:    false,
+			Message:    fmt.Sprintf("Surrender request not found or workflow not started: %v", err),
+			Data:       nil,
+		}, nil
+	}
 
 	// Create activity input from request
 	// activityInput := activities.SubmitDEInput{
@@ -533,7 +520,7 @@ func (h *VoluntarySurrenderHandler) SubmitQC(sctx *serverRoute.Context, req1 Sub
 		PolicyNumber:            req1.PolicyNumber,
 	}
 
-	err := h.temporalClient.SignalWorkflow(sctx.Ctx, workflowID, "", "qc-completed", activityInput)
+	err = h.temporalClient.SignalWorkflow(sctx.Ctx, workflowID, "", "qc-completed", activityInput)
 	if err != nil {
 		log.Error(sctx.Ctx, "Failed to send QC signal: %s", err)
 		return response.GetDEPendingResponse{
@@ -559,8 +546,18 @@ func (h *VoluntarySurrenderHandler) SubmitApproval(sctx *serverRoute.Context, re
 
 	log.Error(sctx.Ctx, "Surrender_request_id  is : %s", req1.Surrender_request_id)
 
-	// Send signal to Temporal workflow with activity input data
-	workflowID := "voluntary-surrender-" + req1.Surrender_request_id
+	// Look up the Temporal workflow ID stored during IndexSurrenderActivity so we
+	// can signal the correct SurrenderProcessingWorkflow instance.
+	workflowID, err := h.surrenderRepo.GetWorkflowIDBySurrenderRequestID(sctx.Ctx, req1.Surrender_request_id)
+	if err != nil {
+		log.Error(sctx.Ctx, "Failed to resolve workflow ID for Approval: %s", err)
+		return response.GetDEPendingResponse{
+			StatusCode: 404,
+			Success:    false,
+			Message:    fmt.Sprintf("Surrender request not found or workflow not started: %v", err),
+			Data:       nil,
+		}, nil
+	}
 
 	// Create activity input from request
 	// activityInput := activities.SubmitApprovalInput{
@@ -604,7 +601,7 @@ func (h *VoluntarySurrenderHandler) SubmitApproval(sctx *serverRoute.Context, re
 		PolicyNumber:            req1.PolicyNumber,
 	}
 
-	err := h.temporalClient.SignalWorkflow(sctx.Ctx, workflowID, "", "approval-completed", activityInput)
+	err = h.temporalClient.SignalWorkflow(sctx.Ctx, workflowID, "", "approval-completed", activityInput)
 	if err != nil {
 		log.Error(sctx.Ctx, "Failed to send Approval signal: %s", err)
 		return response.GetDEPendingResponse{

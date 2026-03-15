@@ -153,8 +153,8 @@ func (r *SurrenderRequestRepository) IndexSurrenderRequestRepo(ctx context.Conte
 	batch := &pgx.Batch{}
 
 	queryInsert := dblib.Psql.Insert("finservicemgmt.surrender_requests").
-		Columns("surrender_request_id", "surrender_request_channel", "request_name", "policy_number", "stage_name", "indexing_office_id", "cpc_office_id", "created_by", "modified_by", "remarks").
-		Values(serviceReqID, "IT2", "Surrender", req.PolicyNumber, req.Stage_name, req.Indexing_office_id, req.Cpc_office_id, req.Created_by, req.Modified_by, req.Remarks)
+		Columns("surrender_request_id", "surrender_request_channel", "request_name", "policy_number", "stage_name", "indexing_office_id", "cpc_office_id", "created_by", "modified_by", "remarks", "temporal_workflow_id", "pm_service_request_id", "pm_policy_db_id").
+		Values(serviceReqID, "IT2", "Surrender", req.PolicyNumber, req.Stage_name, req.Indexing_office_id, req.Cpc_office_id, req.Created_by, req.Modified_by, req.Remarks, req.TemporalWorkflowID, req.PMServiceRequestID, req.PMPolicyDBID)
 
 	dblib.QueueExecRow(batch, queryInsert)
 
@@ -178,6 +178,35 @@ func (r *SurrenderRequestRepository) IndexSurrenderRequestRepo(ctx context.Conte
 
 	return serviceReqID, nil
 
+}
+
+// GetWorkflowIDBySurrenderRequestID looks up the Temporal workflow ID stored
+// in surrender_requests.temporal_workflow_id so DE/QC/Approval handlers can
+// signal the correct running SurrenderProcessingWorkflow instance.
+func (r *SurrenderRequestRepository) GetWorkflowIDBySurrenderRequestID(ctx context.Context, srID string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	query := dblib.Psql.Select("temporal_workflow_id").
+		From("finservicemgmt.surrender_requests").
+		Where(sq.Eq{"surrender_request_id": srID}).
+		PlaceholderFormat(sq.Dollar)
+
+	sql, args, err := query.ToSql()
+	if err != nil {
+		return "", fmt.Errorf("failed to build query: %w", err)
+	}
+
+	var workflowID string
+	err = r.db.QueryRow(ctx, sql, args...).Scan(&workflowID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("surrender request %s not found", srID)
+		}
+		return "", fmt.Errorf("failed to get workflow ID for surrender request %s: %w", srID, err)
+	}
+
+	return workflowID, nil
 }
 
 func (r *SurrenderRequestRepository) SRDetailsRepo(ctx context.Context, srID string) ([]domain.SRDetailsOutput, error) {

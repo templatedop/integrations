@@ -27,7 +27,8 @@ func InitVoluntarySurrenderActivities(surrenderRepo *repo.SurrenderRequestReposi
 }
 
 type ValidateEligibilityInput struct {
-	PolicyID string
+	PolicyID           string
+	SurrenderRequestID string
 }
 
 type ValidateEligibilityResult struct {
@@ -35,11 +36,39 @@ type ValidateEligibilityResult struct {
 	Reasons  []string
 }
 
+// ValidateEligibilityActivity checks surrender-domain business rules:
+//   - Product must not be in the ineligible list (AEA, AEA-10, GY)
+//   - Policy must not have passed its maturity date
+//
+// Note: policy state gate (ACTIVE/VOID_LAPSE/etc.) is already checked by PM
+// before dispatching the child workflow, so it is NOT rechecked here.
 func ValidateEligibilityActivity(ctx context.Context, input ValidateEligibilityInput) (*ValidateEligibilityResult, error) {
-	// Placeholder - would call policy service
+	if activitiesInstance == nil {
+		return nil, fmt.Errorf("activities not initialized")
+	}
+
+	policy, err := activitiesInstance.surrenderRepo.FindByPolicyNumber(ctx, input.PolicyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch policy details for %s: %w", input.PolicyID, err)
+	}
+
+	var reasons []string
+
+	ineligibleProducts := []string{"AEA", "AEA-10", "GY"}
+	for _, prod := range ineligibleProducts {
+		if policy.Product_name == prod {
+			reasons = append(reasons, fmt.Sprintf("product '%s' is not eligible for surrender", policy.Product_name))
+			break
+		}
+	}
+
+	if policy.Maturity_date.Before(time.Now()) {
+		reasons = append(reasons, "policy has reached maturity; process through Maturity Claims")
+	}
+
 	return &ValidateEligibilityResult{
-		Eligible: true,
-		Reasons:  []string{},
+		Eligible: len(reasons) == 0,
+		Reasons:  reasons,
 	}, nil
 }
 
@@ -143,11 +172,10 @@ func UpdatePolicyStatusActivity(ctx context.Context, input UpdatePolicyStatusInp
 type IndexSurrenderInput struct {
 	PolicyNumber            string
 	SurrenderRequestChannel string
-	IndexingOfficeID        int
-	CPCOfficeID             int
-	CreatedBy               int
-	ModifiedBy              int
-	Remarks                 string
+	TemporalWorkflowID      string
+	PMServiceRequestID      int64
+	PMPolicyDBID            int64
+	Stage_name              string
 }
 
 type IndexSurrenderResult struct {
@@ -155,11 +183,30 @@ type IndexSurrenderResult struct {
 	Success          bool
 }
 
+// IndexSurrenderActivity creates the surrender_request record in the DB and
+// stores the Temporal workflow ID so that DE/QC/Approval handlers can later
+// look it up and signal the correct workflow instance.
 func IndexSurrenderActivity(ctx context.Context, input IndexSurrenderInput) (*IndexSurrenderResult, error) {
-	// This would call the actual repository to create the surrender request
-	// For now, return a mock response
+	if activitiesInstance == nil {
+		return nil, fmt.Errorf("activities not initialized")
+	}
+
+	req := domain.IndexSurrenderRequestInput{
+		PolicyNumber:              input.PolicyNumber,
+		Surrender_request_channel: input.SurrenderRequestChannel,
+		Stage_name:                input.Stage_name,
+		TemporalWorkflowID:        input.TemporalWorkflowID,
+		PMServiceRequestID:        input.PMServiceRequestID,
+		PMPolicyDBID:              input.PMPolicyDBID,
+	}
+
+	serviceRequestID, err := activitiesInstance.surrenderRepo.IndexSurrenderRequestRepo(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to index surrender request: %w", err)
+	}
+
 	return &IndexSurrenderResult{
-		ServiceRequestID: "SR-" + time.Now().Format("20060102150405"),
+		ServiceRequestID: serviceRequestID,
 		Success:          true,
 	}, nil
 }

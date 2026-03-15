@@ -402,6 +402,10 @@ type IndexSurrenderRequestInput struct {
 	Created_by                int     `json:"created_by"`
 	Modified_by               int     `json:"modified_by"`
 	Remarks                   string  `json:"remarks"`
+	// PM integration fields — populated when the workflow is dispatched by Policy Management
+	TemporalWorkflowID  string `json:"temporal_workflow_id"`
+	PMServiceRequestID  int64  `json:"pm_service_request_id"`
+	PMPolicyDBID        int64  `json:"pm_policy_db_id"`
 	Paidupvalue               float64 `json:"paidupvalue"`
 	Bonus                     float64 `json:"bonusvalue"`
 	Grossamount               float64 `json:"grossamount"`
