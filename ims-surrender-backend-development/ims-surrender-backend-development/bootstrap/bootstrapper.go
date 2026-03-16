@@ -62,6 +62,9 @@ var FxTemporal = fx.Module(
 		temporal.NewWorkerManager,
 	),
 	fx.Invoke(
+		// InitPMSignalActivities must be called before RegisterWorkflows so the
+		// Temporal client is available when SignalPMWorkflowActivity executes.
+		activities.InitPMSignalActivities,
 		temporal.RegisterWorkflows,
 	),
 )

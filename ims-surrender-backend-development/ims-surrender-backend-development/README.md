@@ -1,93 +1,197 @@
-# ims-surrender-backend
+# IMS Surrender Backend
 
+Surrender processing microservice for PLI/RPLI policies. Handles the full voluntary surrender lifecycle — Data Entry, Quality Check, Approval, calculation, and payment — via Temporal workflows.
 
+---
 
-## Getting started
+## Architecture Overview
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+The surrender service operates as a **downstream child service** under Policy Management (PM). PM is the sole entry point for initiating a surrender; the surrender service handles all subsequent processing steps and signals the outcome back to PM.
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.cept.gov.in/pli/ims-surrender-backend.git
-git branch -M main
-git push -uf origin main
+Customer/Staff
+      |
+      v
+POST /v1/policies/{policy_number}/requests/surrender   [Policy Management]
+      |
+      | Signals PLW (plw-{policy_number})
+      v
+PolicyLifecycleWorkflow  [Policy Management — Temporal]
+      |
+      | ExecuteChildWorkflow("SurrenderProcessingWorkflow")
+      | TaskQueue: surrender-tq
+      v
+SurrenderProcessingWorkflow  [Surrender Service — Temporal]
+      |
+      |-- Step 1: IndexSurrenderActivity        (creates DB record, stores workflow ID)
+      |-- Step 2: ValidateEligibilityActivity   (product + maturity business rules)
+      |
+      |-- Step 3: Wait "de-completed" signal    <-- PUT /v1/surrender/submit-de
+      |           SubmitDEActivity
+      |
+      |-- Step 4: Wait "qc-completed" signal    <-- PUT /v1/surrender/submit-qc
+      |           SubmitQCActivity
+      |
+      |-- Step 5: Wait "approval-completed"     <-- PUT /v1/surrender/submit-approval
+      |           SubmitApprovalActivity
+      |
+      |-- Step 6: CalculateSurrenderValueActivity
+      |-- Step 7: ProcessPaymentActivity
+      |-- Step 8: UpdatePolicyStatusActivity
+      |
+      `-- Step 9: SignalPMWorkflowActivity
+                  Sends "surrender-completed" → plw-{policy_number}
 ```
 
-## Integrate with your tools
+---
 
-- [ ] [Set up project integrations](https://gitlab.cept.gov.in/pli/ims-surrender-backend/-/settings/integrations)
+## PM Integration Changes (March 2026)
 
-## Collaborate with your team
+### What Changed
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+Previously, the surrender service was self-contained: a direct API call to `POST /v1/surrender/index-surrender` created the DB record and started the Temporal workflow. This endpoint is now **decommissioned (returns HTTP 410)**. Policy Management is the only entry point.
 
-## Test and Deploy
+### Flow Differences
 
-Use the built-in continuous integration in GitLab.
+| Aspect | Old Flow | New Flow |
+|--------|----------|----------|
+| Entry point | `POST /v1/surrender/index-surrender` | `POST /v1/policies/{pn}/requests/surrender` (PM) |
+| Workflow start | Handler starts `VoluntarySurrenderWorkflow` | PM dispatches `SurrenderProcessingWorkflow` as child |
+| Task queue | `surrender-task-queue` | `surrender-tq` (matches PM config) |
+| Workflow name | `VoluntarySurrenderWorkflow` | `SurrenderProcessingWorkflow` |
+| DB record creation | Handler before workflow start | Step 1 inside workflow (`IndexSurrenderActivity`) |
+| Eligibility validation | Handler layer (before workflow) | Step 2 inside workflow (`ValidateEligibilityActivity`) |
+| Signal routing | `workflowID = "voluntary-surrender-" + surrenderRequestID` | Look up `temporal_workflow_id` from DB by `surrender_request_id` |
+| Outcome reporting | None | `SignalPMWorkflowActivity` → "surrender-completed" on `plw-{policyNumber}` |
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+### DE / QC / Approval Endpoints (unchanged URLs, updated internals)
 
-***
+These endpoints remain at the surrender service and work the same way from a caller's perspective:
 
-# Editing this README
+- `PUT /v1/surrender/submit-de`
+- `PUT /v1/surrender/submit-qc`
+- `PUT /v1/surrender/submit-approval`
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+**Internal change:** They previously constructed the workflow ID by string concatenation (`"voluntary-surrender-" + surrender_request_id`). They now look up `temporal_workflow_id` from `finservicemgmt.surrender_requests` using the `surrender_request_id` field, then signal that workflow directly.
 
-## Suggestions for a good README
+This lookup works because `IndexSurrenderActivity` (step 1 of the workflow) stores the Temporal workflow ID in the DB as soon as a surrender is initiated by PM.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+---
 
-## Name
-Choose a self-explaining name for your project.
+## Files Changed
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+### New Files
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+| File | Purpose |
+|------|---------|
+| `migrations/003_add_pm_integration.sql` | Adds `temporal_workflow_id`, `pm_service_request_id`, `pm_policy_db_id` columns to `finservicemgmt.surrender_requests` |
+| `temporal/workflows/pm_contract.go` | Input/output contract types shared with PM: `SurrenderProcessingInput`, `OperationCompletedSignal`, outcome constants |
+| `temporal/activities/pm_signal_activity.go` | `SignalPMWorkflowActivity` — signals `surrender-completed` back to PM's `plw-{policyNumber}` workflow |
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+### Modified Files
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+| File | What Changed |
+|------|-------------|
+| `temporal/workflows/voluntary_surrender_workflow.go` | Replaced `VoluntarySurrenderWorkflow` with `SurrenderProcessingWorkflow`; added `signalPMBack` helper; all 9 steps |
+| `temporal/worker.go` | Task queue `surrender-task-queue` → `surrender-tq`; registers `SurrenderProcessingWorkflow` and `SignalPMWorkflowActivity` |
+| `temporal/activities/voluntary_surrender_activities.go` | Implemented real `IndexSurrenderActivity` (calls repo); implemented real `ValidateEligibilityActivity` (product/maturity checks); updated `IndexSurrenderInput` struct with PM fields |
+| `core/domain/surrender_request.go` | Added `TemporalWorkflowID`, `PMServiceRequestID`, `PMPolicyDBID` fields to `IndexSurrenderRequestInput` |
+| `repo/postgres/surrender_request.go` | `IndexSurrenderRequestRepo` now stores the 3 PM fields; new `GetWorkflowIDBySurrenderRequestID` method for signal routing |
+| `handler/voluntary_surrender.go` | `SubmitDE/QC/Approval` look up `temporal_workflow_id` from DB; `IndexSurrender` returns HTTP 410 |
+| `bootstrap/bootstrapper.go` | Added `activities.InitPMSignalActivities` invocation so the Temporal client is injected before the worker starts |
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+---
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+## Database Migration
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+Run `migrations/003_add_pm_integration.sql` before deploying this version:
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```sql
+ALTER TABLE finservicemgmt.surrender_requests
+    ADD COLUMN IF NOT EXISTS temporal_workflow_id  TEXT,
+    ADD COLUMN IF NOT EXISTS pm_service_request_id BIGINT,
+    ADD COLUMN IF NOT EXISTS pm_policy_db_id       BIGINT;
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+CREATE INDEX IF NOT EXISTS idx_surrender_requests_temporal_workflow_id
+    ON finservicemgmt.surrender_requests (temporal_workflow_id)
+    WHERE temporal_workflow_id IS NOT NULL;
+```
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+| Column | Type | Purpose |
+|--------|------|---------|
+| `temporal_workflow_id` | TEXT | Temporal workflow ID (`sur-{uuid}`) — used by DE/QC/Approval handlers to signal the correct workflow |
+| `pm_service_request_id` | BIGINT | Cross-reference to PM's `service_request.request_id` |
+| `pm_policy_db_id` | BIGINT | Cross-reference to PM's `policy.policy_id` |
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+---
 
-## License
-For open source projects, say how it is licensed.
+## PM Contract
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+### Input (PM → Surrender)
+
+PM sends this as the child workflow input. Field names must match exactly.
+
+```go
+type SurrenderProcessingInput struct {
+    RequestID        string          `json:"request_id"`          // PM idempotency key (UUID)
+    PolicyNumber     string          `json:"policy_number"`       // e.g. "PLI/2026/000001"
+    PolicyDBID       int64           `json:"policy_db_id"`        // PM's BIGINT policy_id
+    ServiceRequestID int64           `json:"service_request_id"`  // PM's service_request PK
+    RequestType      string          `json:"request_type"`        // always "SURRENDER"
+    RequestPayload   json.RawMessage `json:"request_payload"`     // original surrender JSON body
+    TimeoutAt        time.Time       `json:"timeout_at"`
+}
+```
+
+`RequestPayload` contains:
+```json
+{
+  "source_channel": "CPC",
+  "disbursement_method": "CHEQUE",
+  "bank_account_id": 123,
+  "reason": "..."
+}
+```
+
+### Output (Surrender → PM)
+
+The `surrender-completed` signal is sent on the `plw-{policyNumber}` workflow with:
+
+```go
+type OperationCompletedSignal struct {
+    RequestID       string          `json:"request_id"`
+    RequestType     string          `json:"request_type"`        // "SURRENDER"
+    Outcome         string          `json:"outcome"`             // APPROVED | REJECTED | TIMEOUT
+    StateTransition string          `json:"state_transition"`    // e.g. "PENDING_SURRENDER→SURRENDERED"
+    OutcomePayload  json.RawMessage `json:"outcome_payload"`     // optional failure reason
+    CompletedAt     time.Time       `json:"completed_at"`
+}
+```
+
+| Outcome | StateTransition | When |
+|---------|----------------|------|
+| `APPROVED` | `PENDING_SURRENDER→SURRENDERED` | Payment processed successfully |
+| `REJECTED` | `PENDING_SURRENDER→ACTIVE` | Any step fails (index, eligibility, DE, QC, approval, payment) |
+| `TIMEOUT` | `PENDING_SURRENDER→ACTIVE` | DE not completed in 7 days, QC not completed in 7 days, or Approval not completed in 30 days |
+
+---
+
+## Eligibility Validation (in Workflow)
+
+`ValidateEligibilityActivity` (step 2) enforces surrender-domain rules. Policy state gate (ACTIVE / VOID_LAPSE / etc.) is checked by PM before dispatch and is **not** rechecked here.
+
+Rules checked:
+- **Ineligible products:** AEA, AEA-10, GY — surrender not allowed
+- **Maturity date:** if `maturity_date` is in the past, redirect to Maturity Claims
+
+---
+
+## Signal Timeouts
+
+| Step | Signal | Timeout |
+|------|--------|---------|
+| Data Entry | `de-completed` | 7 days |
+| Quality Check | `qc-completed` | 7 days |
+| Approval | `approval-completed` | 30 days |
+
+On timeout the workflow sends `TIMEOUT` / `PENDING_SURRENDER→ACTIVE` back to PM and returns an error.

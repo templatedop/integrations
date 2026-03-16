@@ -17,7 +17,9 @@ import (
 
 const (
 	// Task queue names
-	SurrenderTaskQueue       = "surrender-task-queue"
+	// SurrenderTaskQueue must match the task queue PM uses when dispatching
+	// SurrenderProcessingWorkflow as a child workflow ("surrender-tq").
+	SurrenderTaskQueue       = "surrender-tq"
 	ApprovalTaskQueue        = "approval-task-queue"
 	DocumentTaskQueue        = "document-task-queue"
 	PaymentTaskQueue         = "payment-task-queue"
@@ -82,7 +84,9 @@ func NewWorker(temporalClient client.Client) *Worker {
 	w := worker.New(temporalClient, SurrenderTaskQueue, worker.Options{})
 
 	// Register all workflows
-	w.RegisterWorkflow(workflows.VoluntarySurrenderWorkflow)
+	// SurrenderProcessingWorkflow replaces VoluntarySurrenderWorkflow.
+	// It is dispatched by PM's PolicyLifecycleWorkflow as a child workflow.
+	w.RegisterWorkflow(workflows.SurrenderProcessingWorkflow)
 	w.RegisterWorkflow(workflows.ForcedSurrenderWorkflow)
 	w.RegisterWorkflow(workflows.PaymentWindowMonitorWorkflow)
 	w.RegisterWorkflow(workflows.ApprovalWorkflow)
@@ -90,17 +94,19 @@ func NewWorker(temporalClient client.Client) *Worker {
 	w.RegisterWorkflow(workflows.DocumentVerificationWorkflow)
 	w.RegisterWorkflow(workflows.PolicyUpdateWorkflow)
 
-	// Register all activities - Voluntary Surrender
-	w.RegisterActivity(activities.ValidateEligibilityActivity)
-	w.RegisterActivity(activities.CalculateSurrenderValueActivity)
-	w.RegisterActivity(activities.VerifyDocumentsActivity)
-	w.RegisterActivity(activities.RouteToApprovalActivity)
-	w.RegisterActivity(activities.ProcessPaymentActivity)
-	w.RegisterActivity(activities.UpdatePolicyStatusActivity)
+	// Register all activities - Surrender Processing (PM-driven)
 	w.RegisterActivity(activities.IndexSurrenderActivity)
+	w.RegisterActivity(activities.ValidateEligibilityActivity)
 	w.RegisterActivity(activities.SubmitDEActivity)
 	w.RegisterActivity(activities.SubmitQCActivity)
 	w.RegisterActivity(activities.SubmitApprovalActivity)
+	w.RegisterActivity(activities.CalculateSurrenderValueActivity)
+	w.RegisterActivity(activities.ProcessPaymentActivity)
+	w.RegisterActivity(activities.UpdatePolicyStatusActivity)
+	w.RegisterActivity(activities.SignalPMWorkflowActivity)
+	// Legacy activities kept for other workflows
+	w.RegisterActivity(activities.VerifyDocumentsActivity)
+	w.RegisterActivity(activities.RouteToApprovalActivity)
 
 	// Register activities - Forced Surrender
 	w.RegisterActivity(activities.IdentifyEligiblePoliciesActivity)
