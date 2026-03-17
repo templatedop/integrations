@@ -522,6 +522,19 @@ func PolicyIssuanceWorkflow(ctx workflow.Context, input PolicyIssuanceInput) (*P
 		// Don't fail the workflow for notification failure
 	}
 
+	// Step 10: Signal PM service to start lifecycle workflow
+	logger.Info("Step 10: Signalling PM lifecycle for issued policy")
+	pmSignalInput := activities.StartPMLifecycleInput{
+		PolicyNumber: policyNumberResult.PolicyNumber,
+		PolicyType:   string(input.PolicyType),
+	}
+	if err := workflow.ExecuteActivity(externalCallOpts, "StartPMLifecycleActivity", pmSignalInput).Get(ctx, nil); err != nil {
+		// PM signal failure must not block the issuance result — the reconciliation
+		// workflow will retry. The failure is already persisted in proposal_issuance
+		// by the activity itself (pm_signal_status = 'FAILED').
+		logger.Error("PM lifecycle signal failed — reconciliation will retry", "error", err)
+	}
+
 	result.Status = "ISSUED"
 	logger.Info("Policy Issuance Workflow completed successfully", "proposalID", input.ProposalID, "policyNumber", result.PolicyNumber)
 	return result, nil

@@ -2393,3 +2393,101 @@ func (r *ProposalRepository) UpdatePolicyNumber(ctx context.Context, proposalID 
 
 	return nil
 }
+
+// MarkPMSignalSent records a successful PM SignalWithStart for the given policy.
+func (r *ProposalRepository) MarkPMSignalSent(ctx context.Context, policyNumber, plwWorkflowID string) error {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	query := dblib.Psql.
+		Update("policy_issue.proposal_issuance").
+		Set("pm_signal_status", "SENT").
+		Set("pm_signal_sent_at", time.Now().UTC()).
+		Set("pm_plw_workflow_id", plwWorkflowID).
+		Set("pm_signal_last_error", nil).
+		Where(sq.Eq{"policy_number": policyNumber})
+
+	cmdTag, err := dblib.Update(ctx, r.db, query)
+	if err != nil {
+		return fmt.Errorf("MarkPMSignalSent: %w", err)
+	}
+	if cmdTag.RowsAffected() == 0 {
+		return fmt.Errorf("MarkPMSignalSent: no issuance row found for policy %s", policyNumber)
+	}
+	return nil
+}
+
+// MarkPMSignalFailed records a failed PM SignalWithStart attempt.
+func (r *ProposalRepository) MarkPMSignalFailed(ctx context.Context, policyNumber, errMsg string) error {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	query := dblib.Psql.
+		Update("policy_issue.proposal_issuance").
+		Set("pm_signal_status", "FAILED").
+		Set("pm_signal_last_error", errMsg).
+		Set("pm_signal_attempts", sq.Expr("pm_signal_attempts + 1")).
+		Where(sq.Eq{"policy_number": policyNumber})
+
+	_, err := dblib.Update(ctx, r.db, query)
+	if err != nil {
+		return fmt.Errorf("MarkPMSignalFailed: %w", err)
+	}
+	return nil
+}
+
+// PMSignalTarget holds the data needed to replay a PM SignalWithStart.
+type PMSignalTarget struct {
+	PolicyNumber    string    `db:"policy_number"`
+	ProposalID      int64     `db:"proposal_id"`
+	PolicyType      string    `db:"policy_type"`
+	PolicyIssueDate time.Time `db:"policy_issue_date"`
+	Attempts        int       `db:"pm_signal_attempts"`
+}
+
+// FindUnsignalledPolicies returns policies whose PM signal is PENDING (older than
+// gracePeriod) or FAILED, and whose attempt count is below maxAttempts.
+func (r *ProposalRepository) FindUnsignalledPolicies(ctx context.Context, gracePeriod time.Duration, maxAttempts int) ([]PMSignalTarget, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutMed"))
+	defer cancel()
+
+	cutoff := time.Now().UTC().Add(-gracePeriod)
+
+	rows, err := r.db.Query(ctx, `
+		SELECT
+			pi.policy_number,
+			pi.proposal_id,
+			p.policy_type,
+			pi.policy_issue_date,
+			pi.pm_signal_attempts
+		FROM policy_issue.proposal_issuance pi
+		JOIN policy_issue.proposals p USING (proposal_id)
+		WHERE (
+			(pi.pm_signal_status = 'PENDING'  AND pi.policy_issue_date < $1)
+			OR pi.pm_signal_status = 'FAILED'
+		)
+		AND pi.pm_signal_attempts < $2
+		ORDER BY pi.policy_issue_date
+		LIMIT 100
+	`, cutoff, maxAttempts)
+	if err != nil {
+		return nil, fmt.Errorf("FindUnsignalledPolicies query: %w", err)
+	}
+	defer rows.Close()
+
+	var targets []PMSignalTarget
+	for rows.Next() {
+		var t PMSignalTarget
+		if err := rows.Scan(
+			&t.PolicyNumber,
+			&t.ProposalID,
+			&t.PolicyType,
+			&t.PolicyIssueDate,
+			&t.Attempts,
+		); err != nil {
+			return nil, fmt.Errorf("FindUnsignalledPolicies scan: %w", err)
+		}
+		targets = append(targets, t)
+	}
+	return targets, rows.Err()
+}
