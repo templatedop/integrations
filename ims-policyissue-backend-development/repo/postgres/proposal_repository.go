@@ -2417,6 +2417,25 @@ func (r *ProposalRepository) MarkPMSignalSent(ctx context.Context, policyNumber,
 	return nil
 }
 
+// IncrementPMSignalAttempts bumps the pm_signal_attempts counter without
+// changing pm_signal_status. Called before a SignalWithStart attempt so the
+// count is accurate regardless of whether the call succeeds or fails.
+func (r *ProposalRepository) IncrementPMSignalAttempts(ctx context.Context, policyNumber string) error {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
+	defer cancel()
+
+	query := dblib.Psql.
+		Update("policy_issue.proposal_issuance").
+		Set("pm_signal_attempts", sq.Expr("pm_signal_attempts + 1")).
+		Where(sq.Eq{"policy_number": policyNumber})
+
+	_, err := dblib.Update(ctx, r.db, query)
+	if err != nil {
+		return fmt.Errorf("IncrementPMSignalAttempts: %w", err)
+	}
+	return nil
+}
+
 // MarkPMSignalFailed records a failed PM SignalWithStart attempt.
 func (r *ProposalRepository) MarkPMSignalFailed(ctx context.Context, policyNumber, errMsg string) error {
 	ctx, cancel := context.WithTimeout(ctx, r.cfg.GetDuration("db.QueryTimeoutLow"))
@@ -2426,7 +2445,6 @@ func (r *ProposalRepository) MarkPMSignalFailed(ctx context.Context, policyNumbe
 		Update("policy_issue.proposal_issuance").
 		Set("pm_signal_status", "FAILED").
 		Set("pm_signal_last_error", errMsg).
-		Set("pm_signal_attempts", sq.Expr("pm_signal_attempts + 1")).
 		Where(sq.Eq{"policy_number": policyNumber})
 
 	_, err := dblib.Update(ctx, r.db, query)
