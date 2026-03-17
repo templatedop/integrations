@@ -1,9 +1,38 @@
 # Policy Issue → Policy Management Integration Report
 
-**Date:** March 2026
+**Last Updated:** March 2026
 **Scope:** `ims-policyissue-backend-development` integration with `policy-management-development`
 **Requirement Source:** `req_Policy_Management_Orchestrator_v4_1.md` — §10.1, GAP-PM-010
-**Status:** GAP IDENTIFIED — Action Required
+**Status:** PARTIALLY IMPLEMENTED — Signal wired + reliability added; payload contract incomplete
+
+---
+
+## Document Purpose
+
+This report tracks the integration between the Policy Issue (PI) service and the Policy
+Management (PM) service. It was originally raised as a critical gap (PLW never spawned). This
+version reflects what has been implemented and what still needs to be done before the
+integration can be considered production-ready.
+
+---
+
+## Executive Summary
+
+| Area | Before | Now |
+|------|--------|-----|
+| Step 10 in `PolicyIssuanceWorkflow` | ❌ Missing entirely | ✅ Added |
+| PM signal activity (`StartPMLifecycleActivity`) | ❌ Missing | ✅ Added with DB tracking |
+| Signal failure recovery | ❌ None | ✅ Reconciliation workflow (every 15 min) |
+| DB tracking of signal state | ❌ None | ✅ 5 columns in `proposal_issuance` |
+| Unit tests | ❌ None | ✅ 15 test cases |
+| Full PM signal payload (`PolicyCreatedSignal` with `PolicyMetadata`) | ❌ Missing | ⚠️ Simplified stub — not complete |
+| `pm_contract.go` (shared PM types) | ❌ Missing | ❌ Still missing |
+| `InstantIssuanceWorkflow` Step 10 | ❌ Missing | ❌ Still missing |
+| `configs/config.yaml` — `pm.task_queue` | ❌ Missing | ⚠️ Config key works, YAML not updated |
+
+**The integration is now connected and won't be silently dropped, but the signal content
+PM receives does not yet include the full `PolicyMetadata` it expects. This must be
+completed before go-live.**
 
 ---
 
@@ -19,7 +48,7 @@ entire PM lifecycle (req §10.1, GAP-PM-010: *"CRITICAL FIX — PLW won't spawn 
 
 ---
 
-## 2. What PM Expects (The Contract)
+## 2. What PM Expects (The Contract — Unchanged)
 
 ### 2.1 Mechanism
 
@@ -34,308 +63,447 @@ entire PM lifecycle (req §10.1, GAP-PM-010: *"CRITICAL FIX — PLW won't spawn 
 | Signal payload type | `PolicyCreatedSignal` |
 | Idempotency | `SignalWithStart` is inherently idempotent — safe to retry |
 
-### 2.2 Signal Payload (`PolicyCreatedSignal`)
+### 2.2 Signal Payload PM expects (`PolicyCreatedSignal`)
 
 ```go
 type PolicyCreatedSignal struct {
-    RequestID    string         `json:"request_id"`    // UUID idempotency key
+    RequestID    string         `json:"request_id"`    // UUID idempotency key for dedup
     PolicyID     string         `json:"policy_id"`     // PI's UUID (audit cross-ref)
     PolicyNumber string         `json:"policy_number"` // e.g. PLI/2026/000001
-    Metadata     PolicyMetadata `json:"metadata"`      // full policy metadata
+    Metadata     PolicyMetadata `json:"metadata"`      // full policy metadata — see §2.3
 }
 ```
 
 ### 2.3 `PolicyMetadata` fields required at birth
 
-| Field | Source in PI service |
-|-------|---------------------|
-| `CustomerID` (int64) | Parse from `input.CustomerID` (string → int64) |
-| `ProductCode` | `input.ProductCode` |
-| `ProductType` | Derived: `PLI` if `input.PolicyType == PLI*`, else `RPLI` |
-| `SumAssured` | `input.SumAssured` |
-| `CurrentPremium` | From `premiumResult.TotalPayable` (Step 3 of workflow) |
-| `PremiumMode` | `input.PremiumPaymentFrequency` → canonical string |
-| `BillingMethod` | From proposal record (`CASH` or `PAY_RECOVERY`) |
-| `IssueDate` | `time.Now().UTC()` at issuance |
-| `MaturityDate` | Computed in `CreatePolicyIssuanceActivity` as `ProposalDate + PolicyTerm years` |
-| `PaidToDate` | First premium date (same as `IssueDate` at activation) |
-| `AgentID` | From proposal record (nullable) |
-| `NominationStatus` | `"PENDING"` at birth (nominees added later) |
-| `IsDistanceMarketing` | Product config flag (30-day FLC vs 15-day) |
-| `WorkflowID` | `fmt.Sprintf("plw-%s", policyNumber)` |
+| Field | Source in PI service | Implemented? |
+|-------|---------------------|-------------|
+| `CustomerID` (int64) | Parse from `input.CustomerID` (string → int64) | ⚠️ Not in current payload |
+| `ProductCode` | `input.ProductCode` | ⚠️ Not in current payload |
+| `ProductType` | Derived: `PLI` / `RPLI` from `input.PolicyType` | ⚠️ Partially — `PolicyType` sent |
+| `SumAssured` | `input.SumAssured` | ⚠️ Not in current payload |
+| `CurrentPremium` | `premiumResult.TotalPayable` (Step 3) | ⚠️ Not in current payload |
+| `PremiumMode` | `input.PremiumPaymentFrequency` | ⚠️ Not in current payload |
+| `BillingMethod` | From proposal record (`CASH` / `PAY_RECOVERY`) | ⚠️ Not in current payload |
+| `IssueDate` | `time.Now().UTC()` at issuance | ✅ `IssuedAt` present |
+| `MaturityDate` | `CreatePolicyIssuanceActivity` — `ProposalDate + PolicyTerm` | ⚠️ Not in current payload |
+| `PaidToDate` | Same as `IssueDate` at first activation | ⚠️ Not in current payload |
+| `AgentID` | From proposal record (nullable) | ⚠️ Not in current payload |
+| `NominationStatus` | `"PENDING"` at birth | ⚠️ Not in current payload |
+| `IsDistanceMarketing` | Product config flag (30-day vs 15-day FLC) | ⚠️ Not in current payload |
+| `WorkflowID` | `plw-{policy_number}` | ⚠️ Not in current payload |
 
-### 2.4 When to send
+### 2.4 What PI currently sends (`PMCreatedSignal` — stub)
 
-After policy activation is **complete** — specifically after:
-- Step 7b: `CreatePolicyIssuanceActivity` (issuance record + maturity date created) ✅
-- Step 8: `GenerateBondActivity` (bond generated) ✅
-- Step 9: `SendNotificationActivity` ✅
+```go
+// workflows/activities/pm_lifecycle_activities.go
+type PMCreatedSignal struct {
+    PolicyNumber string    `json:"policy_number"`
+    PolicyType   string    `json:"policy_type"`
+    IssuedAt     time.Time `json:"issued_at"`
+}
+```
 
-The PM signal is Step 10 — the final step in `PolicyIssuanceWorkflow`.
+This struct is missing `RequestID`, `PolicyID`, and the entire `PolicyMetadata`. PM's
+`handlePolicyCreated()` handler at `workflows/policy_lifecycle_workflow.go:816` reads
+`Metadata` fields to bootstrap the PLW's state and start the FLC timer. **PM will receive
+the signal but will initialise with empty/zero metadata**, which will cause incorrect
+behaviour (wrong FLC duration, missing premium data, zero CustomerID).
+
+**This is the primary remaining gap.**
 
 ---
 
-## 3. Current State of Policy Issue Service
+## 3. Current State of PI Service
 
-### 3.1 What exists
+### 3.1 What is now implemented
 
-| Component | Status |
-|-----------|--------|
-| `PolicyIssuanceWorkflow` | Implemented — 9 steps, ends at status `"ISSUED"` |
-| `InstantIssuanceWorkflow` | Present (separate flow, same gap) |
-| `ProposalActivities` | Implemented: proposal repo + quote repo + product repo injected |
-| Temporal worker | Running on task queue `policy-issue-queue` |
-| `AadhaarActivities` | Present, separate struct |
+| Component | File | Status |
+|-----------|------|--------|
+| Step 10 in `PolicyIssuanceWorkflow` | `workflows/policy_issuance_workflow.go:525` | ✅ Added |
+| `PMLifecycleActivities` struct | `workflows/activities/pm_lifecycle_activities.go` | ✅ Added |
+| `StartPMLifecycleActivity` | same file | ✅ Added — calls `SignalWithStart` |
+| `FindUnsignalledPoliciesActivity` | same file | ✅ Added |
+| `PMSignalStore` interface | same file | ✅ Added — makes activities testable |
+| `TemporalSignaller` interface | same file | ✅ Added — makes activities testable |
+| `PMSignalReconciliationWorkflow` | `workflows/pm_reconciliation_workflow.go` | ✅ Added |
+| Reconciliation Temporal schedule (every 15 min) | `bootstrap/bootstrapper.go:186` | ✅ Added |
+| `MarkPMSignalSent` / `MarkPMSignalFailed` / `IncrementPMSignalAttempts` | `repo/postgres/proposal_repository.go` | ✅ Added |
+| `FindUnsignalledPolicies` | same file | ✅ Added |
+| Migration 003: 5 tracking columns + partial index on `proposal_issuance` | `db/migrations/003_pm_signal_tracking.sql` | ✅ Added |
+| Activity unit tests (9 cases) | `workflows/activities/pm_lifecycle_activities_test.go` | ✅ Added |
+| Workflow unit tests (6 cases) | `workflows/pm_reconciliation_workflow_test.go` | ✅ Added |
 
-### 3.2 What is missing
+### 3.2 What is still missing
 
-| Missing item | Where | Impact |
-|-------------|-------|--------|
-| Step 10: `signalPMToStartLifecycle()` call | `policy_issuance_workflow.go` | PLW never created — all downstream requests blocked |
-| `StartPMLifecycleActivity` | New file needed | Activity that calls `client.SignalWithStartWorkflow` |
-| `PMLifecycleActivities` struct | New file needed | Holds `temporalClient` for the activity |
-| `NewPMLifecycleActivities` constructor | New file needed | Injected via fx |
-| `bootstrapper.go` — provide `PMLifecycleActivities` | `bootstrap/bootstrapper.go` | Activity never registered with worker |
-| `bootstrapper.go` — register `StartPMLifecycleActivity` | `bootstrap/bootstrapper.go` | Activity not found by worker |
-| PM step in `InstantIssuanceWorkflow` | `instant_issuance_workflow.go` | Same gap — instant-issue path also skips PM |
-| Config key `temporal.pm_task_queue` | `configs/config.yaml` | Task queue hardcoded instead of configurable |
+| Missing item | File | Impact |
+|-------------|------|--------|
+| `pm_contract.go` — PM's shared types (`PolicyCreatedSignal`, `PolicyLifecycleState`, `PolicyMetadata`) | `workflows/pm_contract.go` (new) | PM receives empty metadata; PLW bootstraps with zeros |
+| Full payload construction in `StartPMLifecycleActivity` | `workflows/activities/pm_lifecycle_activities.go` | Same |
+| `constructPMInitialState()` helper | `workflows/policy_issuance_workflow.go` | PLW initial state incomplete |
+| `CreatePolicyIssuanceActivity` — return `MaturityDate` + `BillingMethod` | `workflows/activities/proposal_activities.go` | Fields unavailable for payload construction |
+| Step 10 in `InstantIssuanceWorkflow` | `workflows/instant_issuance_workflow.go` | Aadhaar-based instant issue path still never signals PM |
+| `pm.task_queue` in `configs/config.yaml` | `configs/config.yaml` | Config currently uses code default `"policy-manager-queue"` — must match `"policy-management-tq"` |
 
 ---
 
-## 4. Gap Analysis — File by File
+## 4. What Was Implemented — Detail
 
-### 4.1 `workflows/policy_issuance_workflow.go`
+### 4.1 Migration 003 — `proposal_issuance` tracking columns
 
-**Current last step (line 513–527):**
-```go
-// Step 9: Send notification
-if err := workflow.ExecuteActivity(shortActivityOpts, "SendNotificationActivity", ...).Get(ctx, nil); err != nil {
-    // Don't fail the workflow for notification failure
-}
-result.Status = "ISSUED"
-return result, nil   // <— workflow ends here. PM is never signalled.
+```sql
+ALTER TABLE policy_issue.proposal_issuance
+    ADD COLUMN pm_signal_status   VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+        CHECK (pm_signal_status IN ('PENDING', 'SENT', 'FAILED')),
+    ADD COLUMN pm_signal_sent_at  TIMESTAMP WITH TIME ZONE,
+    ADD COLUMN pm_signal_attempts INT NOT NULL DEFAULT 0,
+    ADD COLUMN pm_signal_last_error TEXT,
+    ADD COLUMN pm_plw_workflow_id  VARCHAR(100);
+
+CREATE INDEX idx_issuance_pm_signal_pending
+    ON proposal_issuance (policy_issue_date)
+    WHERE pm_signal_status IN ('PENDING', 'FAILED');
 ```
 
-**Required addition — Step 10:**
-```go
-// Step 10: Signal PM to start PolicyLifecycleWorkflow
-if err := workflow.ExecuteActivity(shortActivityOpts, "StartPMLifecycleActivity",
-    StartPMLifecycleInput{
-        PolicyNumber: policyNumberResult.PolicyNumber,
-        InitialState: constructPMInitialState(input, policyNumberResult, premiumResult),
-        Signal: PolicyCreatedSignal{
-            RequestID:    workflow.GetInfo(ctx).WorkflowExecution.ID,
-            PolicyID:     input.ProposalNumber, // PI's own identifier for audit
-            PolicyNumber: policyNumberResult.PolicyNumber,
-            Metadata:     <same as initial state metadata>,
-        },
-    }).Get(ctx, nil); err != nil {
-    logger.Error("CRITICAL: Failed to signal PM — PLW not started", "error", err)
-    result.Status = "PM_SIGNAL_FAILED"
-    return result, err  // This IS a hard failure — PM must know about this policy
-}
-result.Status = "ISSUED"
-return result, nil
+| Status value | Meaning |
+|---|---|
+| `PENDING` | Default — policy issued, PM signal not yet confirmed |
+| `SENT` | `SignalWithStart` returned successfully; PLW is live in PM |
+| `FAILED` | Activity exhausted retries; reconciliation worker will retry |
+
+### 4.2 `StartPMLifecycleActivity` — signal + DB tracking flow
+
+```
+Call activity
+  │
+  ├── IncrementPMSignalAttempts()   ← bumps counter regardless of outcome
+  │
+  ├── SignalWithStart()
+  │     ├── SUCCESS → MarkPMSignalSent()   → pm_signal_status = 'SENT'
+  │     └── FAILURE → MarkPMSignalFailed() → pm_signal_status = 'FAILED'
+  │                   return error         → Temporal retries activity
+  │
+  └── DB write failure after success → return error (idempotent retry is safe)
 ```
 
-> **Note:** The PM signal failure **must not be swallowed** (unlike notification failure).
-> Without a PLW, the policy cannot be operated on at all.
+Step 10 in `PolicyIssuanceWorkflow` treats a PM signal failure as **non-fatal** — the
+workflow still returns `ISSUED`. The reconciliation worker is the recovery path. This is
+deliberate: policy issuance itself succeeded; PM connection is a separate concern.
 
-### 4.2 New file: `workflows/activities/pm_lifecycle_activity.go`
+### 4.3 PM Signal Reconciliation Workflow
+
+A Temporal schedule (`pm-signal-reconciliation-schedule`, cron `*/15 * * * *`) triggers
+`PMSignalReconciliationWorkflow` every 15 minutes:
+
+```
+FindUnsignalledPoliciesActivity
+    Query: pm_signal_status IN ('PENDING', 'FAILED')
+           AND policy_issue_date < NOW() - 30 min  (grace period for in-flight workflows)
+           AND pm_signal_attempts < 20
+    Returns: up to 100 policies
+
+For each policy → StartPMLifecycleActivity
+    Per-policy failures logged; loop continues
+    Overlap policy: SKIP (if previous run still in progress)
+```
+
+The 30-minute grace period prevents the reconciliation worker from interfering with a
+`PolicyIssuanceWorkflow` that is still running and hasn't completed Step 10 yet.
+
+---
+
+## 5. What Still Needs to Be Done — Detailed Instructions
+
+### 5.1 Create `workflows/pm_contract.go` (new file)
+
+Copy the 4 type definitions from PM service. These must be byte-for-byte identical to PM's
+structs so that Temporal's JSON serialisation produces matching shapes.
+
+Source in PM: `policy-management-development/workflows/signals.go` (lines ~179–250)
 
 ```go
-package activities
+// workflows/pm_contract.go
+package workflows
 
-import (
-    "context"
-    "fmt"
-    "go.temporal.io/sdk/client"
-    "go.temporal.io/sdk/temporal"
-    temporalEnums "go.temporal.io/api/enums/v1"
-)
+import "time"
 
-type PMLifecycleActivities struct {
-    temporalClient client.Client
-    pmTaskQueue    string  // "policy-management-tq" from config
+// PolicyCreatedSignal is the signal sent to PM's PolicyLifecycleWorkflow on policy birth.
+// Must match PM's definition in signals.go exactly.
+type PolicyCreatedSignal struct {
+    RequestID    string         `json:"request_id"`
+    PolicyID     string         `json:"policy_id"`
+    PolicyNumber string         `json:"policy_number"`
+    Metadata     PolicyMetadata `json:"metadata"`
 }
 
-func NewPMLifecycleActivities(c client.Client, pmTaskQueue string) *PMLifecycleActivities {
-    return &PMLifecycleActivities{temporalClient: c, pmTaskQueue: pmTaskQueue}
+// PolicyLifecycleState is the initial workflow input for PM's PolicyLifecycleWorkflow.
+// Must match PM's definition exactly.
+type PolicyLifecycleState struct {
+    PolicyNumber       string                  `json:"policy_number"`
+    PolicyID           string                  `json:"policy_id"`
+    CurrentStatus      string                  `json:"current_status"`
+    PreviousStatus     string                  `json:"previous_status"`
+    Encumbrances       EncumbranceFlags        `json:"encumbrances"`
+    DisplayStatus      string                  `json:"display_status"`
+    Version            int                     `json:"version"`
+    Metadata           PolicyMetadata          `json:"metadata"`
+    PendingRequests    []PendingRequest        `json:"pending_requests"`
+    ProcessedSignalIDs map[string]time.Time    `json:"processed_signal_ids"`
+    EventCount         int                     `json:"event_count"`
 }
 
-// StartPMLifecycleInput — all data needed to create PLW via SignalWithStart.
-// This struct is constructed by the workflow from its own accumulated state.
+// PolicyMetadata holds the full policy data PM bootstraps from at birth.
+type PolicyMetadata struct {
+    CustomerID          int64     `json:"customer_id"`
+    ProductCode         string    `json:"product_code"`
+    ProductType         string    `json:"product_type"`         // "PLI" or "RPLI"
+    SumAssured          float64   `json:"sum_assured"`
+    CurrentPremium      float64   `json:"current_premium"`
+    PremiumMode         string    `json:"premium_mode"`
+    BillingMethod       string    `json:"billing_method"`       // "CASH" or "PAY_RECOVERY"
+    IssueDate           time.Time `json:"issue_date"`
+    MaturityDate        time.Time `json:"maturity_date"`
+    PaidToDate          time.Time `json:"paid_to_date"`
+    AgentID             *int64    `json:"agent_id,omitempty"`
+    NominationStatus    string    `json:"nomination_status"`    // "PENDING" at birth
+    IsDistanceMarketing bool      `json:"is_distance_marketing"` // true → 30-day FLC
+    WorkflowID          string    `json:"workflow_id"`
+}
+
+// EncumbranceFlags matches PM's type.
+type EncumbranceFlags struct {
+    AssignmentType string `json:"assignment_type"` // "NONE" at birth
+    HasLoan        bool   `json:"has_loan"`
+    HasNomination  bool   `json:"has_nomination"`
+}
+
+// PendingRequest matches PM's type.
+type PendingRequest struct {
+    RequestID   string    `json:"request_id"`
+    RequestType string    `json:"request_type"`
+    ReceivedAt  time.Time `json:"received_at"`
+}
+```
+
+> **Important:** Verify these struct field names and JSON tags against the actual PM source
+> before committing. Any mismatch will cause silent zero-values in PM's state.
+
+### 5.2 Update `StartPMLifecycleInput` and `StartPMLifecycleActivity`
+
+**File:** `workflows/activities/pm_lifecycle_activities.go`
+
+Replace the current `StartPMLifecycleInput` and `PMCreatedSignal` stubs with the full
+types from `pm_contract.go`:
+
+```go
+// StartPMLifecycleInput carries the full PM contract types needed for SignalWithStart.
 type StartPMLifecycleInput struct {
-    PolicyNumber string
-    InitialState PolicyLifecycleState  // matches PM's type exactly (shared contract pkg or duplicated)
-    Signal       PolicyCreatedSignal   // matches PM's type exactly
-}
-
-// StartPMLifecycleActivity — atomically creates PM's PolicyLifecycleWorkflow
-// and delivers the policy-created signal. Safe to retry (SignalWithStart is idempotent).
-func (a *PMLifecycleActivities) StartPMLifecycleActivity(
-    ctx context.Context, input StartPMLifecycleInput,
-) error {
-    workflowID := fmt.Sprintf("plw-%s", input.PolicyNumber)
-    workflowOptions := client.StartWorkflowOptions{
-        ID:        workflowID,
-        TaskQueue: a.pmTaskQueue,
-        WorkflowIDReusePolicy: temporalEnums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
-        RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 1},
-        SearchAttributes: map[string]interface{}{
-            "PolicyNumber":  input.PolicyNumber,
-            "CurrentStatus": "FREE_LOOK_ACTIVE",
-            "ProductType":   input.InitialState.Metadata.ProductType,
-            "BillingMethod": input.InitialState.Metadata.BillingMethod,
-            "IssueDate":     input.InitialState.Metadata.IssueDate,
-        },
-    }
-    _, err := a.temporalClient.SignalWithStartWorkflow(
-        ctx,
-        workflowID,
-        "policy-created",           // SignalPolicyCreated constant from PM contract
-        input.Signal,
-        workflowOptions,
-        "PolicyLifecycleWorkflow",  // Registered workflow type name in PM
-        input.InitialState,
-    )
-    if err != nil {
-        return fmt.Errorf("SignalWithStartWorkflow failed for %s: %w", workflowID, err)
-    }
-    return nil
+    PolicyNumber string                    `json:"policy_number"`
+    InitialState workflows.PolicyLifecycleState `json:"initial_state"`
+    Signal       workflows.PolicyCreatedSignal  `json:"signal"`
 }
 ```
 
-### 4.3 `bootstrap/bootstrapper.go`
+In `StartPMLifecycleActivity`, change the `SignalWithStartWorkflow` call to:
 
-**Current `FxTemporal` provides:**
 ```go
-activities.NewProposalActivities,
-activities.NewAadhaarActivities,
+_, err := a.signaller.SignalWithStartWorkflow(
+    ctx,
+    workflowID,
+    "policy-created",
+    input.Signal,       // full PolicyCreatedSignal with RequestID + PolicyID + Metadata
+    startOpts,
+    "PolicyLifecycleWorkflow",
+    input.InitialState, // full PolicyLifecycleState
+)
 ```
 
-**Required additions:**
+### 5.3 Update `CreatePolicyIssuanceActivity` to return result
+
+**File:** `workflows/activities/proposal_activities.go`
+
+`CreatePolicyIssuanceActivity` currently returns `error` only. It needs to return a result
+struct so the workflow can pass `MaturityDate` and `BillingMethod` to Step 10.
+
 ```go
-// 1. Provide PMLifecycleActivities (needs temporalClient + config)
-func(c client.Client, cfg *config.Config) *activities.PMLifecycleActivities {
-    pmTQ := cfg.GetString("temporal.pm_task_queue")
-    if pmTQ == "" {
-        pmTQ = "policy-management-tq"  // fallback
+// Add this result type:
+type CreatePolicyIssuanceResult struct {
+    MaturityDate  time.Time `json:"maturity_date"`
+    BillingMethod string    `json:"billing_method"` // "CASH" or "PAY_RECOVERY"
+}
+
+// Change signature:
+func (a *ProposalActivities) CreatePolicyIssuanceActivity(
+    ctx context.Context, input CreatePolicyIssuanceInput,
+) (*CreatePolicyIssuanceResult, error) {
+    // ... existing logic ...
+    // Read billing_method from proposal record (already in DB)
+    // Return:
+    return &CreatePolicyIssuanceResult{
+        MaturityDate:  maturityDate,
+        BillingMethod: proposal.BillingMethod, // read from proposals table
+    }, nil
+}
+```
+
+Also update Step 7b in `PolicyIssuanceWorkflow` to capture the result:
+
+```go
+var issuanceResult activities.CreatePolicyIssuanceResult
+if err := workflow.ExecuteActivity(shortActivityOpts,
+    "CreatePolicyIssuanceActivity", issuanceInput).Get(ctx, &issuanceResult); err != nil {
+    // ... error handling
+}
+```
+
+### 5.4 Add `constructPMInitialState()` to `PolicyIssuanceWorkflow`
+
+**File:** `workflows/policy_issuance_workflow.go`
+
+Add this helper function (uses data already accumulated in the workflow by Step 10):
+
+```go
+func constructPMPayload(
+    ctx workflow.Context,
+    input        PolicyIssuanceInput,
+    pnResult     activities.GeneratePolicyNumberResult,
+    premResult   activities.CalculatePremiumResult,
+    issuResult   activities.CreatePolicyIssuanceResult,
+) (PolicyLifecycleState, PolicyCreatedSignal) {
+
+    workflowID := fmt.Sprintf("plw-%s", pnResult.PolicyNumber)
+    now := workflow.Now(ctx).UTC()
+
+    // Parse CustomerID from string to int64
+    customerID, _ := strconv.ParseInt(input.CustomerID, 10, 64)
+
+    meta := PolicyMetadata{
+        CustomerID:          customerID,
+        ProductCode:         input.ProductCode,
+        ProductType:         string(input.PolicyType),
+        SumAssured:          input.SumAssured,
+        CurrentPremium:      premResult.TotalPayable,
+        PremiumMode:         string(input.PremiumPaymentFrequency),
+        BillingMethod:       issuResult.BillingMethod,
+        IssueDate:           now,
+        MaturityDate:        issuResult.MaturityDate,
+        PaidToDate:          now,
+        NominationStatus:    "PENDING",
+        IsDistanceMarketing: false, // TODO: read from product config
+        WorkflowID:          workflowID,
     }
-    return activities.NewPMLifecycleActivities(c, pmTQ)
-},
 
-// 2. Register activity with worker (inside the fx.Invoke function)
-w.RegisterActivity(pmActivities.StartPMLifecycleActivity)
+    state := PolicyLifecycleState{
+        PolicyNumber:       pnResult.PolicyNumber,
+        PolicyID:           input.ProposalNumber,
+        CurrentStatus:      "FREE_LOOK_ACTIVE",
+        Encumbrances:       EncumbranceFlags{AssignmentType: "NONE"},
+        DisplayStatus:      "FREE_LOOK_ACTIVE",
+        Version:            1,
+        Metadata:           meta,
+        PendingRequests:    []PendingRequest{},
+        ProcessedSignalIDs: map[string]time.Time{},
+    }
+
+    signal := PolicyCreatedSignal{
+        RequestID:    workflow.GetInfo(ctx).WorkflowExecution.ID, // dedup key
+        PolicyID:     input.ProposalNumber,
+        PolicyNumber: pnResult.PolicyNumber,
+        Metadata:     meta,
+    }
+
+    return state, signal
+}
 ```
 
-### 4.4 `configs/config.yaml`
+Update Step 10 in the workflow to use it:
 
-Add under the `temporal` section:
+```go
+// Step 10: Signal PM service to start lifecycle workflow
+state, signal := constructPMPayload(ctx, input, policyNumberResult, premiumResult, issuanceResult)
+pmSignalInput := activities.StartPMLifecycleInput{
+    PolicyNumber: policyNumberResult.PolicyNumber,
+    InitialState: state,
+    Signal:       signal,
+}
+if err := workflow.ExecuteActivity(externalCallOpts,
+    "StartPMLifecycleActivity", pmSignalInput).Get(ctx, nil); err != nil {
+    logger.Error("PM lifecycle signal failed — reconciliation will retry", "error", err)
+}
+```
+
+### 5.5 Add Step 10 to `InstantIssuanceWorkflow`
+
+**File:** `workflows/instant_issuance_workflow.go`
+
+The Aadhaar-based instant issuance path has the same gap. After the policy is activated in
+`InstantIssuanceWorkflow`, add the same Step 10 pattern using the same
+`StartPMLifecycleActivity`. The workflow already has access to the relevant fields
+(`PolicyNumber`, `PolicyType`, premium result etc.) — assemble the payload the same way.
+
+### 5.6 Update `configs/config.yaml`
+
+**File:** `configs/config.yaml`
+
+Add the PM task queue under the `temporal` section:
+
 ```yaml
 temporal:
   host: "localhost"
   port: "7233"
   namespace: "default"
-  pm_task_queue: "policy-management-tq"   # <-- ADD THIS
+  pm_task_queue: "policy-management-tq"   # PM service task queue — MUST match PM worker registration
 ```
 
-### 4.5 `workflows/instant_issuance_workflow.go`
-
-The instant issuance flow has the same gap. After policy activation in that workflow,
-the same `StartPMLifecycleActivity` step must be added as the final step before returning.
+The bootstrapper reads `pm.task_queue` (note: different key path — verify consistency with
+the config library's key naming convention used elsewhere in the project).
 
 ---
 
-## 5. Data Construction — `constructPMInitialState()`
-
-This helper must be added to the workflow package. It assembles `PolicyLifecycleState`
-from data already in the workflow at the time of Step 10:
-
-```go
-func constructPMInitialState(
-    input     PolicyIssuanceInput,
-    pnResult  GeneratePolicyNumberResult,
-    premium   CalculatePremiumResult,
-    issuance  CreatePolicyIssuanceResult,   // return this from CreatePolicyIssuanceActivity
-) PolicyLifecycleState {
-    workflowID := fmt.Sprintf("plw-%s", pnResult.PolicyNumber)
-    now := workflow.Now(ctx).UTC()
-
-    return PolicyLifecycleState{
-        PolicyNumber:   pnResult.PolicyNumber,
-        PolicyID:       input.ProposalNumber,  // PI UUID for audit
-        CurrentStatus:  "FREE_LOOK_ACTIVE",
-        PreviousStatus: "",
-        Encumbrances:   EncumbranceFlags{AssignmentType: "NONE"},
-        DisplayStatus:  "FREE_LOOK_ACTIVE",
-        Version:        1,
-        Metadata: PolicyMetadata{
-            CustomerID:    parseCustomerID(input.CustomerID),
-            ProductCode:   input.ProductCode,
-            ProductType:   deriveProductType(input.PolicyType),  // PLI or RPLI
-            SumAssured:    input.SumAssured,
-            CurrentPremium: premium.TotalPayable,
-            PremiumMode:   string(input.PremiumPaymentFrequency),
-            BillingMethod: issuance.BillingMethod,  // needs to be returned by CreatePolicyIssuanceActivity
-            IssueDate:     now,
-            MaturityDate:  issuance.MaturityDate,   // already computed in Step 7b
-            PaidToDate:    now,
-            NominationStatus: "PENDING",
-            WorkflowID:    workflowID,
-        },
-        PendingRequests:    []PendingRequest{},
-        ProcessedSignalIDs: map[string]time.Time{},
-        EventCount:         0,
-    }
-}
-```
-
-**Two small changes needed in `CreatePolicyIssuanceActivity`:**
-- Return `MaturityDate` in its result struct (currently returns nothing)
-- Include `BillingMethod` in result (needs to be read from proposal during the activity)
-
----
-
-## 6. Shared Contract — Type Duplication Strategy
+## 6. Shared Contract — Type Strategy
 
 PM's `PolicyLifecycleState`, `PolicyCreatedSignal`, and `PolicyMetadata` types are defined
 in `policy-management-development/.../workflows/signals.go`.
 
-Policy Issue Service needs to use the **same struct shapes**. Options:
+| Option | Pros | Cons | Decision |
+|--------|------|------|---------|
+| **A — Duplicate in PI (`pm_contract.go`)** | Zero cross-service build dependency; follows surrender service pattern | Manual sync on PM type changes | ✅ **Use this** |
+| B — Shared Go module | Single source of truth | New module overhead; CI changes | ✗ |
 
-| Option | Pros | Cons |
-|--------|------|------|
-| **A — Duplicate the types in PI (with `pm_contract.go`)** | Zero cross-service dependency; same pattern as Surrender service | Must stay in sync manually |
-| B — Shared Go module / library | Single source of truth | New module maintenance overhead |
-| **Recommendation: Option A** | Follows existing surrender pattern; fastest | —
-
-Create `workflows/pm_contract.go` in PI service (same approach used in surrender service
-`temporal/workflows/pm_contract.go`). Copy just the 4 types needed:
-`PolicyLifecycleState`, `PolicyMetadata`, `EncumbranceFlags`, `PolicyCreatedSignal`.
+**Process:** When PM changes any field in `PolicyCreatedSignal` or `PolicyMetadata`,
+PI team must be notified and `pm_contract.go` must be updated in the same sprint.
+Add a comment block in `pm_contract.go` with the PM source file path and last-verified date.
 
 ---
 
 ## 7. Implementation Checklist
 
-| # | Task | File | Owner |
-|---|------|------|-------|
-| 1 | Create `pm_contract.go` with copied PM types | `workflows/pm_contract.go` | PI team |
-| 2 | Create `pm_lifecycle_activity.go` with `StartPMLifecycleActivity` | `workflows/activities/pm_lifecycle_activity.go` | PI team |
-| 3 | Update `CreatePolicyIssuanceActivity` to return `MaturityDate` + `BillingMethod` | `workflows/activities/proposal_activities.go` | PI team |
-| 4 | Add `constructPMInitialState()` helper | `workflows/policy_issuance_workflow.go` | PI team |
-| 5 | Add Step 10 (`StartPMLifecycleActivity`) to `PolicyIssuanceWorkflow` | `workflows/policy_issuance_workflow.go` | PI team |
-| 6 | Add same Step 10 to `InstantIssuanceWorkflow` | `workflows/instant_issuance_workflow.go` | PI team |
-| 7 | Provide `PMLifecycleActivities` via fx in bootstrapper | `bootstrap/bootstrapper.go` | PI team |
-| 8 | Register `StartPMLifecycleActivity` with Temporal worker | `bootstrap/bootstrapper.go` | PI team |
-| 9 | Add `temporal.pm_task_queue` to all config files | `configs/config.yaml` + others | PI team |
-| 10 | Verify PM `PolicyLifecycleWorkflow` handler for `policy-created` (ready) | PM service | PM team (done) |
+| # | Task | File | Status |
+|---|------|------|--------|
+| 1 | Migration 003: 5 tracking columns + index | `db/migrations/003_pm_signal_tracking.sql` | ✅ Done |
+| 2 | `MarkPMSignalSent` / `MarkPMSignalFailed` / `IncrementPMSignalAttempts` / `FindUnsignalledPolicies` repo methods | `repo/postgres/proposal_repository.go` | ✅ Done |
+| 3 | `PMLifecycleActivities` struct + `PMSignalStore` + `TemporalSignaller` interfaces | `workflows/activities/pm_lifecycle_activities.go` | ✅ Done |
+| 4 | `StartPMLifecycleActivity` (signal + DB tracking) | same file | ✅ Done — payload stub |
+| 5 | `FindUnsignalledPoliciesActivity` | same file | ✅ Done |
+| 6 | `PMSignalReconciliationWorkflow` | `workflows/pm_reconciliation_workflow.go` | ✅ Done |
+| 7 | Bootstrapper: provide + register + Temporal schedule | `bootstrap/bootstrapper.go` | ✅ Done |
+| 8 | Step 10 in `PolicyIssuanceWorkflow` | `workflows/policy_issuance_workflow.go` | ✅ Done — simplified payload |
+| 9 | Activity + workflow unit tests (15 cases) | `*_test.go` files | ✅ Done |
+| 10 | `pm_contract.go` — copy PM types | `workflows/pm_contract.go` | ❌ TODO |
+| 11 | Update `StartPMLifecycleInput` + activity to use full PM types | `workflows/activities/pm_lifecycle_activities.go` | ❌ TODO |
+| 12 | `CreatePolicyIssuanceActivity` — return `MaturityDate` + `BillingMethod` | `workflows/activities/proposal_activities.go` | ❌ TODO |
+| 13 | `constructPMPayload()` helper in workflow | `workflows/policy_issuance_workflow.go` | ❌ TODO |
+| 14 | Step 10 in `InstantIssuanceWorkflow` | `workflows/instant_issuance_workflow.go` | ❌ TODO |
+| 15 | `pm_task_queue` in `configs/config.yaml` | `configs/config.yaml` | ❌ TODO |
+
+**Items 10–15 must be completed before production use. Items 1–9 are merged to branch
+`claude/setup-dual-projects-9Qi9t`.**
 
 ---
 
-## 8. PM Service Readiness Confirmation
+## 8. PM Service Readiness Confirmation (Unchanged)
 
-The PM service (`policy-management-tq`) is **ready to receive the signal**:
+The PM service (`policy-management-tq`) is ready to receive the signal:
 
 | Check | Status |
 |-------|--------|
@@ -347,59 +515,105 @@ The PM service (`policy-management-tq`) is **ready to receive the signal**:
 | `RecordStateTransitionActivity` called on receipt | ✅ Persists `FREE_LOOK_ACTIVE` to DB |
 | Duplicate signal detection (dedup by `RequestID`) | ✅ `isDuplicate()` check |
 
-**Nothing to change in PM service for this integration.**
+**Nothing to change in PM service. Waiting on PI service to send the correct payload.**
 
 ---
 
-## 9. Sequence Diagram — After Integration
+## 9. Sequence Diagram — Current State + Reconciliation
 
 ```
-PolicyIssuanceWorkflow
+PolicyIssuanceWorkflow (PI)
 ├── Step 1:  ValidateProposalActivity
 ├── Step 2:  CheckEligibilityActivity
-├── Step 3:  CalculatePremiumActivity
+├── Step 3:  CalculatePremiumActivity        ← premiumResult accumulated here
 ├── Step 3b: SavePremiumToProposalActivity
 ├── Step 4:  [QC Signal loop]
 ├── Step 5:  RequestMedicalReviewActivity + [Medical Signal]
 ├── Step 6:  RouteToApproverActivity + [Approver Signal]
 ├── Step 7:  GeneratePolicyNumberActivity
-├── Step 7b: CreatePolicyIssuanceActivity  ← now returns MaturityDate + BillingMethod
+├── Step 7b: CreatePolicyIssuanceActivity    ← TODO: return MaturityDate + BillingMethod
 ├── Step 8:  GenerateBondActivity + UpdateBondDetailsActivity
 ├── Step 9:  SendNotificationActivity
-└── Step 10: StartPMLifecycleActivity          ← NEW
+└── Step 10: StartPMLifecycleActivity        ✅ NOW PRESENT
+              │  proposal_issuance.pm_signal_status → 'PENDING' (at row creation)
+              │  IncrementPMSignalAttempts()
               │
-              │ client.SignalWithStartWorkflow(
-              │   "plw-PLI/2026/000001",      WorkflowID
-              │   "policy-created",            Signal channel
-              │   PolicyCreatedSignal{...},    Signal payload
-              │   "policy-management-tq",      Task queue
-              │   PolicyLifecycleWorkflow,     Workflow type
-              │   PolicyLifecycleState{        Workflow input
-              │     CurrentStatus: "FREE_LOOK_ACTIVE",
-              │     ...
-              │   }
-              │ )
-              ▼
-    PolicyLifecycleWorkflow (PM — plw-PLI/2026/000001)
+              ├── SignalWithStartWorkflow(
+              │     workflowID:  "plw-PLI/2026/000001"
+              │     signal:      "policy-created"
+              │     payload:     PMCreatedSignal{...}  ⚠️ stub — full payload TODO
+              │     task_queue:  "policy-manager-queue" ⚠️ wrong — must be "policy-management-tq"
+              │     workflow:    "PolicyLifecycleWorkflow"
+              │     input:       PMCreatedSignal{...}   ⚠️ stub — full state TODO
+              │   )
               │
-              ├── Receives "policy-created" signal
-              ├── Records FREE_LOOK_ACTIVE → DB
-              ├── Starts FLC timer (15d or 30d)
-              │   └── On expiry → transitions to ACTIVE
-              └── Enters signal-select loop
-                  (all future policy requests now routable)
+              ├── SUCCESS → pm_signal_status = 'SENT'
+              └── FAILURE → pm_signal_status = 'FAILED' → Temporal retries → reconciliation
+
+
+PM Signal Reconciliation (every 15 min via Temporal Schedule)
+├── FindUnsignalledPoliciesActivity
+│     SELECT WHERE pm_signal_status IN ('PENDING','FAILED')
+│       AND policy_issue_date < NOW() - 30min
+│       AND pm_signal_attempts < 20
+│     LIMIT 100
+│
+└── For each policy → StartPMLifecycleActivity
+      (SignalWithStart is idempotent — safe to retry)
+
+
+PolicyLifecycleWorkflow (PM — plw-PLI/2026/000001)   ← ready and waiting
+├── Receives "policy-created" signal
+├── Reads Metadata → TODO: currently receives empty metadata
+├── Records FREE_LOOK_ACTIVE → DB
+├── Starts FLC timer (15d or 30d based on IsDistanceMarketing)
+└── Enters signal-select loop
+    (all future policy requests now routable once payload is correct)
 ```
 
 ---
 
-## 10. Risk If Not Implemented
+## 10. Risk Assessment
 
-| Risk | Impact |
-|------|--------|
-| No PLW running for issued policy | PM rejects ALL requests (surrender, loan, revival, claim) with "workflow not found" |
-| No `FREE_LOOK_ACTIVE` state in PM | FLC handler (`flc-request` signal) has no target workflow — FLC cannot be processed |
-| No FLC timer | Policy never automatically transitions to `ACTIVE` — stuck in `FREE_LOOK_ACTIVE` forever |
-| No initial state persisted | PM cannot answer state-gate queries for CPC / portal |
+| Risk | Severity | Status |
+|------|----------|--------|
+| PLW never spawned (no Step 10 at all) | CRITICAL | ✅ Resolved — Step 10 now present |
+| Signal silently dropped on transient failure | HIGH | ✅ Resolved — DB tracking + reconciliation |
+| PLW bootstraps with empty/zero `PolicyMetadata` | HIGH | ⚠️ Active — payload stub incomplete |
+| Wrong FLC duration (0 days because `IsDistanceMarketing` is false/zero) | HIGH | ⚠️ Active — `IsDistanceMarketing` not set |
+| PM dedup fails (`RequestID` is empty string) | MEDIUM | ⚠️ Active — `RequestID` not set |
+| `InstantIssuanceWorkflow` still has no Step 10 | HIGH | ⚠️ Active — not yet implemented |
+| Config key `pm.task_queue` points to wrong queue name | HIGH | ⚠️ Active — YAML not updated |
+| Policy stuck in `FREE_LOOK_ACTIVE` forever (if `IsDistanceMarketing` not set) | HIGH | ⚠️ Active — FLC timer depends on this flag |
 
-**This is a blocking dependency. No downstream operation on any issued policy will work
-until this integration is implemented.**
+---
+
+## 11. Onboarding — How to Pick Up the Remaining Work
+
+**Recommended order for the PI team to complete items 10–15:**
+
+1. **Start with §5.1** — create `pm_contract.go`. This is purely copying types with no
+   logic. Verify each field against PM's `signals.go` side-by-side.
+
+2. **Then §5.3** — update `CreatePolicyIssuanceActivity` to return `MaturityDate` +
+   `BillingMethod`. Read `billing_method` from the `proposals` table (it's already in the
+   schema). Update Step 7b in the workflow to capture the result struct.
+
+3. **Then §5.4** — add `constructPMPayload()` and update Step 10. At this point the full
+   signal will be sent.
+
+4. **Then §5.2** — update `StartPMLifecycleInput` to use the types from `pm_contract.go`.
+   Update the activity tests to use the full struct.
+
+5. **Then §5.5** — add Step 10 to `InstantIssuanceWorkflow` using the same helper.
+
+6. **Finally §5.6** — update `configs/config.yaml` and verify the config key path used
+   in the bootstrapper (`pm.task_queue` vs `temporal.pm_task_queue`).
+
+**Integration smoke test** (after all 6 steps):
+1. Issue a test policy through the full `PolicyIssuanceWorkflow`
+2. Verify `proposal_issuance.pm_signal_status = 'SENT'`
+3. Verify `plw-{policy_number}` workflow exists in PM's Temporal namespace
+4. Verify PM's `proposal_issuance` table has a `FREE_LOOK_ACTIVE` row for the policy
+5. Verify the FLC timer is scheduled (check PM workflow history for `StartTimer`)
+6. Repeat steps 1–5 for an instant-issue (Aadhaar) policy
