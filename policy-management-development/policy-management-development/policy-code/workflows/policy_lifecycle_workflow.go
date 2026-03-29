@@ -1107,6 +1107,8 @@ func handleFinancialRequest(ctx workflow.Context, state *PolicyLifecycleState, s
 		ServiceRequestID: sig.ServiceRequestID,
 		RequestType:      sig.RequestType,
 		TimeoutAt:        timeout,
+		MaturityDate:     state.MaturityDate,
+		ProductCode:      state.ProductCode,
 	}
 	workflow.ExecuteChildWorkflow(childWFCtx(ctx, taskQueue, childID), wfType, childInput)
 
@@ -1296,9 +1298,10 @@ func handleNFRRequest(ctx workflow.Context, state *PolicyLifecycleState, sig Pol
 // Returns true if a terminal state was reached.
 func handleOperationCompleted(ctx workflow.Context, state *PolicyLifecycleState, sig OperationCompletedSignal) bool {
 	// Dedup check — downstream services may retry operation-completed signals. [B5]
-	if _, seen := state.ProcessedSignalIDs[sig.RequestID]; seen {
-		return false
-	}
+	// if _, seen := state.ProcessedSignalIDs[sig.RequestID]; seen {
+	// 	log.Info(context.TODO(), "////", state.ProcessedSignalIDs, "req:", sig.RequestID)
+	// 	return false
+	// }
 
 	// Audit: log signal receipt in policy_signal_log. [B5, Review-Fix-2]
 	sigPayload, _ := json.Marshal(sig)
